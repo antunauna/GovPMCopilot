@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Policy",
+  "type": "object",
+  "required": ["policy_id", "title", "level", "region", "department", "source_url", "lifecycle_status"],
+  "properties": {
+    "policy_id": { "type": "string" },
+    "title": { "type": "string" },
+    "level": { "type": "string" },
+    "region": { "type": "string" },
+    "department": { "type": "string" },
+    "publish_date": { "type": ["string", "null"], "format": "date" },
+    "deadline": { "type": ["string", "null"], "format": "date" },
+    "support_direction": { "type": "array", "items": { "type": "string" } },
+    "support_type": { "type": ["string", "null"] },
+    "eligibility_conditions": { "type": "array", "items": { "type": "string" } },
+    "material_list": { "type": "array", "items": { "type": "string" } },
+    "source_url": { "type": "string" },
+    "source_type": { "type": ["string", "null"] },
+    "lifecycle_status": { "type": "string" },
+    "evidence_snippets": { "type": "array", "items": { "type": "string" } }
+  }
+}

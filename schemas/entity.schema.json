@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Entity",
+  "type": "object",
+  "required": ["entity_id", "name", "region"],
+  "properties": {
+    "entity_id": { "type": "string" },
+    "name": { "type": "string" },
+    "region": { "type": "string" },
+    "industry": { "type": ["string", "null"] },
+    "incorporation_date": { "type": ["string", "null"], "format": "date" },
+    "revenue": { "type": ["number", "null"] },
+    "employee_count": { "type": ["integer", "null"] },
+    "rd_spend": { "type": ["number", "null"] },
+    "rd_ratio": { "type": ["number", "null"] },
+    "certifications": { "type": "array", "items": { "type": "string" } },
+    "ip_assets": { "type": "array", "items": { "type": "string" } },
+    "compliance_status": { "type": ["string", "null"] }
+  }
+}

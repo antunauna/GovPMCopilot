@@ -1,0 +1,3 @@
+interface:
+  display_name: "EntityMatcher"
+  short_description: "Match the right legal entity to each government policy opportunity"

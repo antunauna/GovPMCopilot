@@ -1,0 +1,3 @@
+interface:
+  display_name: "WorkflowOrchestrator"
+  short_description: "Coordinate workflow state, handoffs, reminders, and audit traceability"

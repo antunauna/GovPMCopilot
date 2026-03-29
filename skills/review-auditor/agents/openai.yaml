@@ -1,0 +1,3 @@
+interface:
+  display_name: "ReviewAuditor"
+  short_description: "Pre-review application materials with scoring and risk findings"

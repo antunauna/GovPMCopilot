@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MatchResult",
+  "type": "object",
+  "required": ["policy_id", "entity_id", "match_score", "hard_gate_passed"],
+  "properties": {
+    "policy_id": { "type": "string" },
+    "entity_id": { "type": "string" },
+    "match_score": { "type": "number" },
+    "hard_gate_passed": { "type": "boolean" },
+    "blocking_issues": { "type": "array", "items": { "type": "string" } },
+    "gap_analysis": { "type": "array", "items": { "type": "string" } },
+    "recommendation": { "type": ["string", "null"] }
+  }
+}

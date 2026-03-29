@@ -1,0 +1,3 @@
+interface:
+  display_name: "ProposalComposer"
+  short_description: "Draft structured government application materials from verified inputs"

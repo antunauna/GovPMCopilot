@@ -1,0 +1,3 @@
+interface:
+  display_name: "GovPMCopilot"
+  short_description: "Coordinate end-to-end government project automation across all sub-skills"

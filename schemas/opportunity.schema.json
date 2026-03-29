@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Opportunity",
+  "type": "object",
+  "required": ["opportunity_id", "policy_id", "workflow_state"],
+  "properties": {
+    "opportunity_id": { "type": "string" },
+    "policy_id": { "type": "string" },
+    "entity_id": { "type": ["string", "null"] },
+    "project_direction": { "type": ["string", "null"] },
+    "owner": { "type": ["string", "null"] },
+    "workflow_state": { "type": "string" },
+    "priority": { "type": ["string", "null"] },
+    "deadline": { "type": ["string", "null"], "format": "date" },
+    "next_actions": { "type": "array", "items": { "type": "string" } }
+  }
+}

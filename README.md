@@ -1,14 +1,20 @@
-# GovPM Copilot
+# GovPM Copilot v0.3
 
-政府项目全流程自动化助手 — 轻量级 CLI 工具，基于 Agent Loop 架构。
+政府项目全流程自动化助手 — 一个轻量的 CLI Agent 工具，借鉴 Claude Code 架构设计。
 
 ## 特性
 
-- 🔄 **Agent Loop** — 流式输出 + 多轮工具调用 + 上下文自动压缩
-- 🤖 **双 Provider** — 支持 Anthropic Claude 和阿里百炼（DashScope）
-- 🔧 **工具系统** — 文件读写、工具自省，可扩展
-- 🌐 **联网搜索** — 通过 DashScope 原生 `enable_search` 实时检索政府政策
-- 💬 **交互模式** — REPL 交互 + `--chat` 单次对话
+- **双 Provider** — 阿里百炼（DashScope）+ Anthropic Claude，REPL 内可动态切换
+- **流式 Agent Loop** — 多轮工具调用，上下文自动压缩
+- **联网搜索** — DashScope 原生 `enable_search`，无需独立搜索工具
+- **Markdown 渲染** — 终端内渲染标题、列表、表格、代码块、引用
+- **中断处理** — Ctrl+C / Escape 中断当前请求，保留上下文（双击 Ctrl+C 退出）
+- **API 重试** — 429/5xx 自动指数退避重试（1s→2s→4s，最大 30s）
+- **工具超时** — 每个工具执行有独立超时控制（默认 30s）
+- **对话持久化** — 自动保存到 `~/.govpm/sessions/`，支持恢复
+- **Token 追踪** — 实时统计 token 用量和费用估算
+- **System Prompt 动态化** — 支持从文件加载或命令行设置
+- **工具可视化** — Spinner 动画 + 参数摘要 + 结果预览
 
 ## 快速开始
 
@@ -16,66 +22,78 @@
 # 安装依赖
 npm install
 
-# 配置 API Key（二选一）
-set DASHSCOPE_API_KEY=sk-your-key    # 阿里百炼（推荐国内用户）
-set ANTHROPIC_API_KEY=sk-your-key    # Anthropic Claude
+# 设置 API Key
+set DASHSCOPE_API_KEY=sk-xxx
 
-# 交互模式
+# 启动
 npm run dev
-
-# 单次对话
-npx tsx src/index.ts --chat "2026年深圳高新技术企业补贴政策"
 ```
 
 ## 架构
 
 ```
 src/
-├── index.ts              # CLI 入口（REPL + --chat 单次模式）
-├── config.ts             # 配置管理（环境变量 > 配置文件 > 默认值）
-├── types.ts              # 统一类型定义
+├── index.ts          # CLI 入口（REPL + 单次模式 + Ctrl+C 处理）
+├── config.ts         # 配置管理（环境变量 > 配置文件 > 默认值）
+├── types.ts          # 统一类型定义
 ├── agent/
-│   ├── loop.ts           # Agent Loop 核心（流式循环 + 工具执行 + 上下文压缩）
-│   └── compact.ts        # Token 估算
+│   ├── loop.ts       # 核心引擎（流式循环 + 工具执行 + 中断 + 可视化）
+│   └── compact.ts    # 上下文压缩（本地提取 + LLM 摘要 + 熔断）
 ├── providers/
-│   ├── dashscope.ts      # 阿里百炼 Provider（OpenAI 兼容协议）
-│   └── anthropic.ts      # Anthropic Provider
-└── tools/
-    └── index.ts          # 工具注册（read_file, write_file, list_tools）
+│   ├── dashscope.ts  # 百炼 Provider（OpenAI 兼容 + 重试 + 中断）
+│   └── anthropic.ts  # Anthropic Provider
+├── tools/
+│   └── index.ts      # 工具集（read_file / write_file / list_tools）
+└── utils/
+    ├── render.ts     # Markdown 终端渲染（ANSI 颜色）
+    ├── spinner.ts    # Spinner 动画 + 超时包装
+    ├── retry.ts      # HTTP 重试（指数退避）
+    ├── session.ts    # 对话持久化
+    └── index.ts      # 工具导出
 ```
-
-## 工具
-
-| 工具 | 说明 | 权限 |
-|------|------|------|
-| `read_file` | 读取文件内容 | auto |
-| `write_file` | 写入文件（需确认） | confirm |
-| `list_tools` | 列出可用工具 | auto |
-
-联网搜索通过 DashScope API 原生 `enable_search` 参数实现，无需独立工具。
 
 ## REPL 命令
 
 | 命令 | 说明 |
 |------|------|
 | `/help` | 显示帮助 |
+| `/status` | 当前状态（消息数、token） |
+| `/cost` | Token/成本统计 |
 | `/tools` | 列出工具 |
-| `/status` | 上下文状态 |
-| `/config` | 显示配置 |
 | `/clear` | 清空对话历史 |
 | `/compact` | 手动压缩上下文 |
-| `/quit` | 退出 |
+| `/save` | 保存当前会话 |
+| `/resume` | 恢复上次会话 |
+| `/sessions` | 列出历史会话 |
+| `/provider` | 切换 Provider |
+| `/model` | 切换模型 |
+| `/system` | 设置 System Prompt |
+| `/quit` | 退出（自动保存） |
 
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `DASHSCOPE_API_KEY` | 阿里百炼 API Key | - |
-| `ANTHROPIC_API_KEY` | Anthropic API Key | - |
+| `DASHSCOPE_API_KEY` | 阿里百炼 API Key | — |
+| `ANTHROPIC_API_KEY` | Anthropic API Key | — |
 | `GOVPM_PROVIDER` | LLM 提供商 | `dashscope` |
 | `GOVPM_MODEL` | 模型名称 | `qwen-plus` |
-| `GOVPM_DATA_DIR` | 数据目录 | `./govpm-data` |
-| `LLM_BASE_URL` | 自定义 API 地址 | - |
+| `LLM_BASE_URL` | 自定义 API 地址 | 百炼官方 |
+
+## 快捷键
+
+| 键 | 说明 |
+|----|------|
+| `Ctrl+C` | 中断当前请求（保留上下文） |
+| `Ctrl+C` × 2 | 退出程序 |
+| `Escape` | 中断当前请求 |
+
+## 技术栈
+
+- TypeScript + ES2022 + ES Modules
+- Node.js 18+
+- 零 UI 框架（纯 CLI + ANSI 转义码）
+- 参考 Claude Code 的 Agent Loop / Permission Pipeline / Skill System 设计
 
 ## License
 

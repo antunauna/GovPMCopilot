@@ -1,6 +1,5 @@
 /**
- * GovPMCopilot v0.2 - 最小可用版本
- * 统一类型定义
+ * GovPMCopilot v0.3 - 统一类型定义
  */
 
 // ============================================
@@ -40,6 +39,7 @@ export interface ChatOptions {
   tools?: ToolDef[];
   toolChoice?: 'auto' | 'none' | { type: 'tool'; name: string };
   enableSearch?: boolean;  // 启用联网搜索（百炼专用）
+  signal?: AbortSignal;    // 用于中断请求
 }
 
 export interface ChatResponse {
@@ -65,6 +65,16 @@ export interface LLMProvider {
   chatStream(messages: Message[], options?: ChatOptions): AsyncIterable<StreamEvent>;
   readonly name: string;
   readonly model: string;
+}
+
+// ============================================
+// Token 追踪
+// ============================================
+
+export interface TokenUsage {
+  totalInput: number;
+  totalOutput: number;
+  requestCount: number;
 }
 
 // ============================================
@@ -100,6 +110,8 @@ export interface Tool {
   execute(input: Record<string, unknown>, ctx: ToolContext): Promise<string>;
   /** 权限级别 */
   permission?: 'auto' | 'confirm' | 'block';
+  /** 超时时间（ms），默认 30000 */
+  timeout?: number;
 }
 
 export interface ToolContext {
@@ -131,4 +143,6 @@ export interface AgentConfig {
   maxContextTokens: number;
   compactThreshold: number;
   stream: boolean;
+  /** System Prompt 文件路径（优先级高于内置默认） */
+  systemPromptFile?: string;
 }

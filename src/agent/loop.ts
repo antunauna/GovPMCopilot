@@ -1,17 +1,28 @@
 /**
- * Agent Loop - 核心引擎
- * 流式输出 + 工具调用 + 上下文压缩
+ * Agent Loop - 核心引擎 v0.3
+ *
+ * 改进：
+ * - Ctrl+C / Escape 中断（AbortController + SIGINT）
+ * - Markdown 终端渲染
+ * - 工具调用可视化（Spinner + 参数摘要 + 结果预览）
+ * - API 错误重试 + 请求中断信号传播
+ * - 工具执行超时
+ * - LLM 摘要式上下文压缩（含熔断）
+ * - Token/成本追踪
+ * - System Prompt 动态化（支持外部文件）
  */
 
 import { createInterface } from 'readline';
+import { readFileSync, existsSync } from 'fs';
 import type {
   LLMProvider, Message, ContentBlock, ChatOptions,
-  ToolCall, ToolResult, StreamEvent, AgentConfig,
+  StreamEvent, AgentConfig, TokenUsage,
 } from '../types.js';
 import { getToolDefs, getTool } from '../tools/index.js';
-import { estimateTokens } from './compact.js';
+import { estimateMessagesTokens, compactMessages } from './compact.js';
+import { renderMarkdownToTerminal, colors, Spinner, withTimeout } from '../utils/index.js';
 
-const SYSTEM_PROMPT = `你是 GovPM Copilot（政府项目助手），帮助用户完成政府项目申报、政策查询、材料撰写等工作。
+const DEFAULT_SYSTEM_PROMPT = `你是 GovPM Copilot（政府项目助手），帮助用户完成政府项目申报、政策查询、材料撰写等工作。
 
 你的能力：
 - 联网搜索最新的政府政策、通知、公告（已内置联网搜索，可直接回答实时问题）
@@ -38,10 +49,27 @@ export class AgentLoop {
   private config: Required<AgentConfig>;
   private aborted = false;
   private turnCount = 0;
+  private systemPrompt: string;
+  private consecutiveCompactFailures = 0;
+  private tokenUsage: TokenUsage = { totalInput: 0, totalOutput: 0, requestCount: 0 };
+  private currentAbortController: AbortController | null = null;
 
   constructor(provider: LLMProvider, config?: AgentConfig) {
     this.provider = provider;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.systemPrompt = this.loadSystemPrompt(config?.systemPromptFile);
+  }
+
+  /** 加载 System Prompt（外部文件 > 内置默认） */
+  private loadSystemPrompt(filePath?: string): string {
+    if (filePath && existsSync(filePath)) {
+      try {
+        return readFileSync(filePath, 'utf-8').trim();
+      } catch {
+        return DEFAULT_SYSTEM_PROMPT;
+      }
+    }
+    return DEFAULT_SYSTEM_PROMPT;
   }
 
   /** 获取当前消息历史（用于序列化） */
@@ -56,34 +84,75 @@ export class AgentLoop {
 
   /** 估算当前上下文 token 数 */
   contextTokenCount(): number {
-    return estimateTokens(JSON.stringify(this.messages)) + 500; // + system prompt
+    return estimateMessagesTokens(this.messages, this.systemPrompt);
+  }
+
+  /** 获取 token 使用统计 */
+  getTokenUsage(): TokenUsage {
+    return { ...this.tokenUsage };
+  }
+
+  /** 获取 Provider */
+  getProvider(): LLMProvider {
+    return this.provider;
+  }
+
+  /** 动态切换 Provider */
+  setProvider(provider: LLMProvider) {
+    this.provider = provider;
+  }
+
+  /** 设置 System Prompt（从字符串） */
+  setSystemPrompt(prompt: string) {
+    this.systemPrompt = prompt;
+  }
+
+  /** 创建新的 AbortController（用于中断当前请求） */
+  abort(): void {
+    this.aborted = true;
+    if (this.currentAbortController) {
+      this.currentAbortController.abort();
+    }
   }
 
   /** 执行一轮用户对话 */
   async run(userInput: string, signal?: AbortSignal): Promise<void> {
     this.aborted = false;
     this.turnCount = 0;
+    this.currentAbortController = new AbortController();
+
+    // 链接外部 signal
+    if (signal) {
+      signal.addEventListener('abort', () => this.abort(), { once: true });
+    }
+
     this.messages.push({ role: 'user', content: userInput });
 
-    await this.loop(signal);
+    try {
+      await this.loop(this.currentAbortController.signal);
+    } finally {
+      this.currentAbortController = null;
+    }
   }
 
   /** 核心循环 */
-  private async loop(signal?: AbortSignal): Promise<void> {
+  private async loop(signal: AbortSignal): Promise<void> {
     while (this.turnCount < this.config.maxTurns && !this.aborted) {
       this.turnCount++;
 
       // 检查上下文压缩
-      if (this.contextTokenCount() > this.config.compactThreshold) {
+      const estimatedTokens = this.contextTokenCount();
+      if (estimatedTokens > this.config.compactThreshold) {
         await this.compact();
       }
 
       const toolDefs = getToolDefs();
       const options: ChatOptions = {
         maxTokens: 8192,
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt: this.systemPrompt,
         tools: toolDefs,
-        enableSearch: true,  // 默认开启百炼联网搜索
+        enableSearch: true,
+        signal,
       };
 
       if (this.config.stream) {
@@ -91,6 +160,8 @@ export class AgentLoop {
       } else {
         await this.syncTurn(options);
       }
+
+      if (this.aborted) return;
 
       // 检查是否有工具调用（最后一个 assistant 消息）
       const lastMsg = this.messages[this.messages.length - 1];
@@ -106,27 +177,39 @@ export class AgentLoop {
   }
 
   /** 流式处理一轮 */
-  private async streamTurn(options: ChatOptions, signal?: AbortSignal): Promise<void> {
+  private async streamTurn(options: ChatOptions, signal: AbortSignal): Promise<void> {
     const toolCalls = new Map<string, { name: string; inputParts: string[] }>();
     let textParts: string[] = [];
+    let lastUsage: { inputTokens: number; outputTokens: number } | undefined;
 
     try {
       const stream = this.provider.chatStream(this.messages, options);
 
       for await (const event of stream) {
-        if (this.aborted || signal?.aborted) {
+        if (this.aborted || signal.aborted) {
           this.aborted = true;
-          process.stdout.write('\n');
+          // 如果有累积文本，先渲染
+          if (textParts.length > 0) {
+            process.stdout.write('\n');
+          } else {
+            process.stdout.write('\n');
+          }
+          process.stdout.write(`${colors.yellow}⏹ 已中断${colors.reset}\n`);
           return;
         }
 
         switch (event.type) {
           case 'text':
-            process.stdout.write(event.text || '');
+            // 流式累积文本，最后一口气渲染
             textParts.push(event.text || '');
             break;
 
           case 'tool_use_start':
+            // 先把累积的文本渲染出来
+            if (textParts.length > 0) {
+              process.stdout.write('\n' + renderMarkdownToTerminal(textParts.join('')) + '\n');
+              textParts = [];
+            }
             toolCalls.set(event.toolId || `tool_${Date.now()}`, { name: event.toolName || '', inputParts: [] });
             break;
 
@@ -135,7 +218,6 @@ export class AgentLoop {
             if (tid && toolCalls.has(tid) && event.inputJson) {
               toolCalls.get(tid)!.inputParts.push(event.inputJson);
             } else if (event.inputJson) {
-              // fallback: 追加到最后一个活跃工具
               const keys = [...toolCalls.keys()];
               if (keys.length > 0) toolCalls.get(keys[keys.length - 1])!.inputParts.push(event.inputJson);
             }
@@ -143,13 +225,34 @@ export class AgentLoop {
           }
 
           case 'tool_use_end':
-            // tool_use_end - 工具调用完成，状态已在 toolCalls map 中
             break;
 
           case 'message_end':
-            // 流结束
+            if (event.usage) {
+              lastUsage = event.usage;
+            }
             break;
+
+          case 'error':
+            process.stdout.write(`\n${colors.red}❌ 错误: ${event.error}${colors.reset}\n`);
+            this.messages.push({
+              role: 'assistant',
+              content: [{ type: 'text', text: `发生错误: ${event.error}` }],
+            });
+            return;
         }
+      }
+
+      // 渲染最后累积的文本
+      if (textParts.length > 0) {
+        process.stdout.write('\n' + renderMarkdownToTerminal(textParts.join('')) + '\n');
+      }
+
+      // 记录 token 使用量
+      if (lastUsage) {
+        this.tokenUsage.totalInput += lastUsage.inputTokens;
+        this.tokenUsage.totalOutput += lastUsage.outputTokens;
+        this.tokenUsage.requestCount++;
       }
 
       // 构建助手消息
@@ -167,15 +270,24 @@ export class AgentLoop {
         content.push({ type: 'tool_use', id, name: tc.name, input: parsed });
       }
 
-      this.messages.push({ role: 'assistant', content });
+      if (content.length > 0) {
+        this.messages.push({ role: 'assistant', content });
+      }
 
     } catch (err: any) {
       if (err.name === 'AbortError' || this.aborted) {
-        process.stdout.write('\n[已中断]\n');
+        if (textParts.length > 0) {
+          process.stdout.write('\n' + renderMarkdownToTerminal(textParts.join('')) + '\n');
+        }
+        process.stdout.write(`${colors.yellow}⏹ 已中断${colors.reset}\n`);
         return;
       }
-      process.stdout.write(`\n[错误: ${err.message}]\n`);
-      this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `发生错误: ${err.message}` }] });
+      process.stdout.write(`\n${colors.red}❌ 错误: ${err.message}${colors.reset}\n`);
+      this.messages.push({
+        role: 'assistant',
+        content: [{ type: 'text', text: `发生错误: ${err.message}` }],
+      });
+      this.consecutiveCompactFailures++;
     }
   }
 
@@ -184,20 +296,28 @@ export class AgentLoop {
     const response = await this.provider.chat(this.messages, options);
     this.messages.push({ role: 'assistant', content: response.content });
 
-    // 输出文本
+    // 记录 token
+    this.tokenUsage.totalInput += response.usage.inputTokens;
+    this.tokenUsage.totalOutput += response.usage.outputTokens;
+    this.tokenUsage.requestCount++;
+
     for (const block of response.content) {
       if (block.type === 'text') {
-        process.stdout.write(block.text + '\n');
+        process.stdout.write('\n' + renderMarkdownToTerminal(block.text) + '\n');
       }
     }
   }
 
-  /** 执行工具调用 */
-  private async executeTools(blocks: ContentBlock[], signal?: AbortSignal): Promise<void> {
+  /** 执行工具调用（带超时 + 可视化） */
+  private async executeTools(blocks: ContentBlock[], signal: AbortSignal): Promise<void> {
     const toolResults: ContentBlock[] = [];
 
     for (const block of blocks) {
       if (block.type !== 'tool_use' || !block.id) continue;
+      if (this.aborted || signal.aborted) {
+        this.aborted = true;
+        break;
+      }
 
       const tool = getTool(block.name);
       if (!tool) {
@@ -205,10 +325,14 @@ export class AgentLoop {
         continue;
       }
 
+      // 构建工具调用的参数摘要
+      const inputStr = JSON.stringify(block.input || {});
+      const paramSummary = inputStr.length > 100 ? inputStr.slice(0, 100) + '...' : inputStr;
+
       // 权限检查
       if (tool.permission === 'confirm') {
-        process.stdout.write(`\n⚠️  需要确认执行工具: ${block.name}\n`);
-        process.stdout.write(`输入参数: ${JSON.stringify(block.input, null, 2)}\n`);
+        process.stdout.write(`\n${colors.yellow}⚠️  需要确认执行工具: ${colors.bold}${block.name}${colors.reset}\n`);
+        process.stdout.write(`${colors.dim}参数: ${paramSummary}${colors.reset}\n`);
         process.stdout.write(`确认执行? [y/N] `);
 
         const confirmed = await new Promise<boolean>((resolve) => {
@@ -221,61 +345,66 @@ export class AgentLoop {
 
         if (!confirmed) {
           toolResults.push({ type: 'tool_result', id: block.id, output: '用户取消了操作' });
+          process.stdout.write(`${colors.dim}已取消${colors.reset}\n`);
           continue;
         }
       }
 
-      process.stdout.write(`\n🔧 执行工具: ${block.name}...\n`);
+      // 启动 Spinner
+      const spinner = new Spinner(`${block.name}(${paramSummary})`);
+      spinner.start();
 
       try {
-        const result = await tool.execute(block.input as Record<string, unknown>, {
-          dataDir: process.cwd(),
-          workDir: process.cwd(),
-        });
+        const timeout = tool.timeout || 30000;
+        const result = await withTimeout(
+          tool.execute(block.input as Record<string, unknown>, {
+            dataDir: process.cwd(),
+            workDir: process.cwd(),
+          }),
+          timeout,
+        );
+
         toolResults.push({ type: 'tool_result', id: block.id, output: result });
 
-        // 截断过长结果
-        const displayResult = result.length > 3000 ? result.slice(0, 3000) + '\n... [结果过长已截断]' : result;
-        process.stdout.write(`✅ ${block.name} 完成\n`);
+        // 结果预览
+        spinner.stop(true);
+        const preview = result.length > 200 ? result.slice(0, 200) + `\n${colors.dim}... (共 ${result.length} 字符)${colors.reset}` : result;
+        process.stdout.write(`${colors.dim}  → ${preview.split('\n')[0]}${colors.reset}\n`);
       } catch (err: any) {
-        toolResults.push({ type: 'tool_result', id: block.id, output: `执行失败: ${err.message}` });
-        process.stdout.write(`❌ ${block.name} 失败: ${err.message}\n`);
-      }
-
-      if (signal?.aborted) {
-        this.aborted = true;
-        break;
+        const isTimeout = err.message?.includes('超时');
+        toolResults.push({
+          type: 'tool_result',
+          id: block.id,
+          output: isTimeout ? `执行超时（${tool.timeout || 30000}ms）` : `执行失败: ${err.message}`,
+        });
+        spinner.stop(false);
       }
     }
 
     // 将工具结果作为用户消息发送
-    this.messages.push({ role: 'user', content: toolResults });
+    if (toolResults.length > 0) {
+      this.messages.push({ role: 'user', content: toolResults });
+    }
   }
 
-  /** 上下文压缩 */
+  /** 上下文压缩（LLM 摘要式 + 熔断） */
   private async compact(): Promise<void> {
-    const keepCount = 6; // 保留最近 6 条消息
-    if (this.messages.length <= keepCount + 2) return; // 没什么可压缩的
+    const keepCount = 6;
+    const result = await compactMessages(
+      this.messages,
+      keepCount,
+      this.provider,
+      this.consecutiveCompactFailures,
+    );
 
-    const oldMessages = this.messages.slice(0, this.messages.length - keepCount);
-    const recentMessages = this.messages.slice(this.messages.length - keepCount);
+    if (result.result.compressed) {
+      this.messages = result.messages;
+      this.consecutiveCompactFailures = 0;
 
-    // 简单压缩：把老消息拼成摘要文本
-    const summary = oldMessages
-      .map(m => {
-        const content = typeof m.content === 'string' ? m.content :
-          (m.content as ContentBlock[]).map(b => b.type === 'text' ? b.text : `[${b.type}]`).join('');
-        const truncated = (content || '').slice(0, 200);
-        return `${m.role}: ${truncated}`;
-      })
-      .join('\n');
-
-    this.messages = [
-      { role: 'user', content: `[历史对话摘要，共 ${oldMessages.length} 条消息]:\n${summary}` },
-      { role: 'assistant', content: [{ type: 'text', text: '好的，我已了解历史上下文。请继续。' }] },
-      ...recentMessages,
-    ];
-
-    process.stdout.write(`\n📦 上下文已压缩（${oldMessages.length} → 摘要）\n`);
+      const method = result.result.summaryMethod === 'llm' ? 'AI 摘要' : '本地提取';
+      process.stdout.write(
+        `\n${colors.cyan}📦 上下文已压缩${colors.reset} (${result.result.originalCount} → ${result.result.originalCount - result.result.removedCount + 2} 条，${method})\n`,
+      );
+    }
   }
 }

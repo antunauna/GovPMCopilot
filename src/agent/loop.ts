@@ -1,26 +1,49 @@
 /**
- * Agent Loop - 核心引擎 v0.3
+ * Agent Loop - 核心引擎 v0.4
  *
- * 改进：
- * - Ctrl+C / Escape 中断（AbortController + SIGINT）
- * - Markdown 终端渲染
- * - 工具调用可视化（Spinner + 参数摘要 + 结果预览）
- * - API 错误重试 + 请求中断信号传播
- * - 工具执行超时
- * - LLM 摘要式上下文压缩（含熔断）
- * - Token/成本追踪
- * - System Prompt 动态化（支持外部文件）
+ * v0.4 改进：
+ * - LLM 调用自动重试（指数退避，最多 3 次）
+ * - Token 使用量持久化到 ~/.govpm/cost-tracker.json
+ * - v0.3 保留：
+ *   - Ctrl+C / Escape 中断（AbortController + SIGINT）
+ *   - Markdown 终端渲染
+ *   - 工具调用可视化（Spinner + 参数摘要 + 结果预览）
+ *   - API 错误重试 + 请求中断信号传播
+ *   - 工具执行超时
+ *   - LLM 摘要式上下文压缩（含熔断）
+ *   - Token/成本追踪
+ *   - System Prompt 动态化（支持外部文件）
  */
 
 import { createInterface } from 'readline';
 import { readFileSync, existsSync } from 'fs';
 import type {
   LLMProvider, Message, ContentBlock, ChatOptions,
-  StreamEvent, AgentConfig, TokenUsage,
+  AgentConfig, TokenUsage,
 } from '../types.js';
 import { getToolDefs, getTool } from '../tools/index.js';
 import { estimateMessagesTokens, compactMessages } from './compact.js';
 import { renderMarkdownToTerminal, colors, Spinner, withTimeout } from '../utils/index.js';
+import { recordUsage } from '../utils/session.js';
+
+/** LLM 调用重试配置 */
+const LLM_RETRY_CONFIG = {
+  maxRetries: 2,       // 最大重试次数（不含首次）
+  baseDelay: 2000,     // 首次重试延迟（ms）
+  maxDelay: 10000,     // 最大延迟
+  retryableErrors: ['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'socket hang up', 'overloaded', 'rate limit', '503', '502'],
+};
+
+/** 延迟函数 */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** 判断错误是否可重试 */
+function isRetryableError(err: any): boolean {
+  const msg = (err?.message || '').toLowerCase();
+  return LLM_RETRY_CONFIG.retryableErrors.some(e => msg.includes(e.toLowerCase()));
+}
 
 const DEFAULT_SYSTEM_PROMPT = `你是 GovPM Copilot（政府项目助手），帮助用户完成政府项目申报、政策查询、材料撰写等工作。
 
@@ -156,9 +179,9 @@ export class AgentLoop {
       };
 
       if (this.config.stream) {
-        await this.streamTurn(options, signal);
+        await this.streamWithRetry(options, signal);
       } else {
-        await this.syncTurn(options);
+        await this.syncWithRetry(options);
       }
 
       if (this.aborted) return;
@@ -174,6 +197,54 @@ export class AgentLoop {
       // 执行工具调用
       await this.executeTools(content, signal);
     }
+  }
+
+  /** 带重试的 LLM 流式调用 */
+  private async streamWithRetry(messages: Message[], options: ChatOptions, signal: AbortSignal): Promise<void> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= LLM_RETRY_CONFIG.maxRetries; attempt++) {
+      if (this.aborted || signal.aborted) return;
+
+      try {
+        await this.streamTurn(options, signal);
+        return; // 成功
+      } catch (err: any) {
+        lastError = err;
+        if (err.name === 'AbortError' || this.aborted) return;
+        if (!isRetryableError(err) || attempt >= LLM_RETRY_CONFIG.maxRetries) throw err;
+
+        const delay = Math.min(LLM_RETRY_CONFIG.baseDelay * Math.pow(2, attempt), LLM_RETRY_CONFIG.maxDelay);
+        process.stderr.write(`\n  ⚠️ LLM 调用失败，${delay / 1000}s 后重试 (${attempt + 1}/${LLM_RETRY_CONFIG.maxRetries}): ${err.message}\n`);
+        await sleep(delay);
+      }
+    }
+
+    throw lastError;
+  }
+
+  /** 带重试的 LLM 非流式调用 */
+  private async syncWithRetry(options: ChatOptions): Promise<void> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= LLM_RETRY_CONFIG.maxRetries; attempt++) {
+      if (this.aborted) return;
+
+      try {
+        await this.syncTurn(messages, options);
+        return; // 成功
+      } catch (err: any) {
+        lastError = err;
+        if (err.name === 'AbortError' || this.aborted) return;
+        if (!isRetryableError(err) || attempt >= LLM_RETRY_CONFIG.maxRetries) throw err;
+
+        const delay = Math.min(LLM_RETRY_CONFIG.baseDelay * Math.pow(2, attempt), LLM_RETRY_CONFIG.maxDelay);
+        process.stderr.write(`\n  ⚠️ LLM 调用失败，${delay / 1000}s 后重试 (${attempt + 1}/${LLM_RETRY_CONFIG.maxRetries}): ${err.message}\n`);
+        await sleep(delay);
+      }
+    }
+
+    throw lastError;
   }
 
   /** 流式处理一轮 */
@@ -253,6 +324,8 @@ export class AgentLoop {
         this.tokenUsage.totalInput += lastUsage.inputTokens;
         this.tokenUsage.totalOutput += lastUsage.outputTokens;
         this.tokenUsage.requestCount++;
+        // 持久化到磁盘
+        recordUsage(lastUsage.inputTokens, lastUsage.outputTokens, this.provider.name, this.provider.model);
       }
 
       // 构建助手消息
@@ -300,6 +373,8 @@ export class AgentLoop {
     this.tokenUsage.totalInput += response.usage.inputTokens;
     this.tokenUsage.totalOutput += response.usage.outputTokens;
     this.tokenUsage.requestCount++;
+    // 持久化到磁盘
+    recordUsage(response.usage.inputTokens, response.usage.outputTokens, this.provider.name, this.provider.model);
 
     for (const block of response.content) {
       if (block.type === 'text') {

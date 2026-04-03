@@ -20,7 +20,8 @@ import { AnthropicProvider, DashScopeProvider } from './providers/index.js';
 import { AgentLoop } from './agent/loop.js';
 import { getAllTools } from './tools/index.js';
 import { colors } from './utils/render.js';
-import { saveSession, updateSession, loadSession, listSessions, getLatestSession } from './utils/session.js';
+import { saveSession, updateSession, loadSession, listSessions, getLatestSession, cleanupSessions, loadCostTracker } from './utils/session.js';
+import { startDashboard, DASHBOARD_PORT } from './utils/dashboard.js';
 import type { LLMProvider, AppConfig, ProviderType } from './types.js';
 
 // ============================================
@@ -54,6 +55,10 @@ async function runREPL(config: AppConfig) {
   const agent = new AgentLoop(provider);
   let currentSessionId: string | null = null;
   let pendingInput: ((input: string) => void) | null = null;
+  let dashboardServer: import('http').Server | null = null;
+
+  // 自动清理过期会话
+  cleanupSessions();
 
   // 尝试恢复最近的会话
   const latest = getLatestSession();
@@ -94,6 +99,11 @@ ${colors.cyan}╔═════════════════════
       // 自动保存
       if (hasUnsavedChanges) {
         currentSessionId = updateSessionAndSave(agent, currentSessionId);
+      }
+      // 关闭 Dashboard
+      if (dashboardServer) {
+        dashboardServer.close();
+        dashboardServer = null;
       }
       console.log(`\n${colors.yellow}👋 再见！${colors.reset}`);
       rl.close();
@@ -183,6 +193,7 @@ ${colors.bold}  可用命令:${colors.reset}
   ${colors.cyan}/provider${colors.reset}   切换 Provider
   ${colors.cyan}/model${colors.reset}      切换模型
   ${colors.cyan}/system${colors.reset}     设置 System Prompt
+  ${colors.cyan}/dashboard${colors.reset}  打开成本监控面板（Web）
 
 ${colors.bold}  快捷键:${colors.reset}
   ${colors.cyan}Ctrl+C${colors.reset}      中断当前请求（双击退出）
@@ -224,15 +235,32 @@ ${colors.bold}  快捷键:${colors.reset}
 
       if (trimmed === '/cost') {
         const usage = agent.getTokenUsage();
-        console.log(`\n  ${colors.bold}Token 使用统计:${colors.reset}`);
+        const tracker = loadCostTracker();
+        console.log(`\n  ${colors.bold}═══ 本次会话 ═══${colors.reset}`);
         console.log(`  输入:  ${usage.totalInput.toLocaleString()} tokens`);
         console.log(`  输出:  ${usage.totalOutput.toLocaleString()} tokens`);
         console.log(`  合计:  ${(usage.totalInput + usage.totalOutput).toLocaleString()} tokens`);
         console.log(`  请求:  ${usage.requestCount} 次`);
-        // 粗略估算费用（百炼 qwen-plus 约 4元/百万输入 + 12元/百万输出）
         const inputCost = usage.totalInput * 0.000004;
         const outputCost = usage.totalOutput * 0.000012;
-        console.log(`  ${colors.dim}(百炼 qwen-plus 估算: ¥${(inputCost + outputCost).toFixed(4)})${colors.reset}\n`);
+        console.log(`  估算:  ¥${(inputCost + outputCost).toFixed(4)}`);
+
+        console.log(`\n  ${colors.bold}═══ 累计统计 ═══${colors.reset}`);
+        console.log(`  总输入:  ${tracker.allTime.totalInput.toLocaleString()} tokens`);
+        console.log(`  总输出:  ${tracker.allTime.totalOutput.toLocaleString()} tokens`);
+        console.log(`  总请求:  ${tracker.allTime.requestCount} 次`);
+        console.log(`  总费用:  ¥${tracker.allTime.estimatedCost.toFixed(4)}`);
+
+        // 最近 7 天趋势
+        const recent = tracker.daily.slice(-7);
+        if (recent.length > 0) {
+          console.log(`\n  ${colors.bold}═══ 最近 7 天 ═══${colors.reset}`);
+          for (const d of recent) {
+            const bar = '█'.repeat(Math.min(Math.ceil(d.estimatedCost * 500), 20));
+            console.log(`  ${colors.dim}${d.date}${colors.reset}  ${bar || '-'} ¥${d.estimatedCost.toFixed(4)}`);
+          }
+        }
+        console.log('');
         prompt();
         return;
       }
@@ -359,6 +387,22 @@ ${colors.bold}  快捷键:${colors.reset}
         return;
       }
 
+      if (trimmed === '/dashboard') {
+        if (dashboardServer) {
+          dashboardServer.close();
+          dashboardServer = null;
+          console.log(`${colors.green}✅ Dashboard 已关闭${colors.reset}\n`);
+        } else {
+          const tracker = loadCostTracker();
+          dashboardServer = startDashboard(tracker, (port) => {
+            console.log(`${colors.green}✅ Dashboard 已启动: http://${'127.0.0.1'}:${port}${colors.reset}`);
+            console.log(`${colors.dim}   输入 /dashboard 关闭\n${colors.reset}`);
+          });
+        }
+        prompt();
+        return;
+      }
+
       // ---- 正常对话 ----
       try {
         await agent.run(trimmed);
@@ -401,7 +445,7 @@ if (args.includes('--version') || args.includes('-v')) {
 
 if (args.includes('--help') || args.includes('-h')) {
   console.log(`
-${colors.cyan}GovPM Copilot${colors.reset} - 政府项目全流程自动化助手 v0.3
+${colors.cyan}GovPM Copilot${colors.reset} - 政府项目全流程自动化助手 v0.4
 
 ${colors.bold}用法:${colors.reset}
   govpm                  进入交互模式

@@ -7,7 +7,7 @@
  * 3. LLM 摘要：调用 LLM 生成结构化摘要（降级为本地提取如果 LLM 不可用）
  */
 
-import type { Message, ContentBlock, LLMProvider, TokenUsage } from '../types.js';
+import type { Message, ContentBlock, LLMProvider } from '../types.js';
 
 /** 粗略估算 token 数（中文约 1.5 字符/token，英文约 4 字符/token） */
 export function estimateTokens(text: string): number {

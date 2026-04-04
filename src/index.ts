@@ -23,6 +23,26 @@ import { colors } from './utils/render.js';
 import { saveSession, updateSession, loadSession, listSessions, getLatestSession, cleanupSessions, loadCostTracker } from './utils/session.js';
 import { startDashboard, DASHBOARD_PORT } from './utils/dashboard.js';
 import type { LLMProvider, AppConfig, ProviderType } from './types.js';
+import { resolve, normalize } from 'path';
+import { existsSync, readFileSync } from 'fs';
+
+/** 校验路径是否在工作目录内（防止路径遍历） */
+function isPathSafe(inputPath: string): { safe: boolean; resolved: string; reason?: string } {
+  try {
+    const resolved = resolve(inputPath);
+    const cwd = resolve(process.cwd());
+    const normalizedResolved = normalize(resolved).toLowerCase();
+    const normalizedCwd = normalize(cwd).toLowerCase();
+
+    // 允许工作目录及其子目录
+    if (normalizedResolved === normalizedCwd || normalizedResolved.startsWith(normalizedCwd + '\\') || normalizedResolved.startsWith(normalizedCwd + '/')) {
+      return { safe: true, resolved };
+    }
+    return { safe: false, resolved, reason: '路径超出工作目录范围' };
+  } catch {
+    return { safe: false, resolved: inputPath, reason: '无效的路径' };
+  }
+}
 
 // ============================================
 // 创建 Provider
@@ -96,6 +116,8 @@ ${colors.cyan}╔═════════════════════
     // 双击 Ctrl+C：退出
     if (ctrlCCount >= 2) {
       if (ctrlCTimer) clearTimeout(ctrlCTimer);
+      // 恢复 stdin 模式
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
       // 自动保存
       if (hasUnsavedChanges) {
         currentSessionId = updateSessionAndSave(agent, currentSessionId);
@@ -124,7 +146,7 @@ ${colors.cyan}╔═════════════════════
   // Windows 原生信号
   process.on('SIGINT', onSigInt);
 
-  // Windows: 监听 stdin 的 Escape 键
+  // Windows: 监听 stdin 的 Escape 键（Raw Mode 在整个 REPL 生命周期内保持开启）
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
     process.stdin.on('data', (chunk: Buffer) => {
@@ -137,8 +159,7 @@ ${colors.cyan}╔═════════════════════
         }
       }
     });
-    // 恢复 readline 的 keypress 模式
-    process.stdin.setRawMode(false);
+    // Raw Mode 在退出时恢复（见 /quit 和双击 Ctrl+C 处理）
   }
 
   /** 自动保存会话 */
@@ -160,7 +181,7 @@ ${colors.cyan}╔═════════════════════
       ? `${colors.dim}[${usage.requestCount}次请求, ${(usage.totalInput + usage.totalOutput).toLocaleString()} tokens]${colors.reset} `
       : '';
 
-    rl.question(`${statusStr}> `, (input) => {
+    rl.question(`${statusStr}> `, async (input) => {
       const trimmed = input.trim();
 
       if (!trimmed) { prompt(); return; }
@@ -171,6 +192,7 @@ ${colors.cyan}╔═════════════════════
         if (hasUnsavedChanges) {
           currentSessionId = updateSessionAndSave(agent, currentSessionId);
         }
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
         console.log(`${colors.yellow}👋 再见！${colors.reset}`);
         rl.close();
         process.exit(0);
@@ -355,16 +377,26 @@ ${colors.bold}  快捷键:${colors.reset}
           agent.setSystemPrompt('');
           console.log(`${colors.green}✅ System Prompt 已恢复默认${colors.reset}\n`);
         } else if (args[0]) {
-          // 从文件加载
-          try {
-            const { readFileSync: rfs } = await import('fs');
-            const prompt = rfs(args[0], 'utf-8');
-            agent.setSystemPrompt(prompt);
-            console.log(`${colors.green}✅ System Prompt 已从 ${args[0]} 加载${colors.reset}\n`);
-          } catch {
-            // 直接作为文本设置
-            agent.setSystemPrompt(trimmed.slice(8));
-            console.log(`${colors.green}✅ System Prompt 已更新${colors.reset}\n`);
+          // 先尝试作为文件路径加载（需安全校验）
+          const pathCheck = isPathSafe(args[0]);
+          if (pathCheck.safe) {
+            try {
+              if (existsSync(pathCheck.resolved)) {
+                const prompt = readFileSync(pathCheck.resolved, 'utf-8');
+                agent.setSystemPrompt(prompt);
+                console.log(`${colors.green}✅ System Prompt 已从 ${pathCheck.resolved} 加载${colors.reset}\n`);
+              } else {
+                // 文件不存在，当作文本设置
+                agent.setSystemPrompt(trimmed.slice(8));
+                console.log(`${colors.green}✅ System Prompt 已更新${colors.reset}\n`);
+              }
+            } catch {
+              agent.setSystemPrompt(trimmed.slice(8));
+              console.log(`${colors.green}✅ System Prompt 已更新${colors.reset}\n`);
+            }
+          } else {
+            console.log(`${colors.red}❌ 路径不安全: ${pathCheck.reason}（${args[0]}）${colors.reset}`);
+            console.log(`${colors.dim}   文件必须在当前工作目录 (${process.cwd()}) 内${colors.reset}\n`);
           }
         } else {
           console.log(`\n  用法: /system <文件路径|文本>`);

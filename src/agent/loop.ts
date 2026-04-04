@@ -64,6 +64,7 @@ const DEFAULT_CONFIG: Required<AgentConfig> = {
   maxContextTokens: 100000,
   compactThreshold: 60000,
   stream: true,
+  systemPromptFile: undefined as unknown as string, // 占位，实际由 constructor 处理
 };
 
 export class AgentLoop {
@@ -200,7 +201,7 @@ export class AgentLoop {
   }
 
   /** 带重试的 LLM 流式调用 */
-  private async streamWithRetry(messages: Message[], options: ChatOptions, signal: AbortSignal): Promise<void> {
+  private async streamWithRetry(options: ChatOptions, signal: AbortSignal): Promise<void> {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= LLM_RETRY_CONFIG.maxRetries; attempt++) {
@@ -231,7 +232,7 @@ export class AgentLoop {
       if (this.aborted) return;
 
       try {
-        await this.syncTurn(messages, options);
+        await this.syncTurn(options);
         return; // 成功
       } catch (err: any) {
         lastError = err;
@@ -378,7 +379,7 @@ export class AgentLoop {
 
     for (const block of response.content) {
       if (block.type === 'text') {
-        process.stdout.write('\n' + renderMarkdownToTerminal(block.text) + '\n');
+        process.stdout.write('\n' + renderMarkdownToTerminal(block.text || '') + '\n');
       }
     }
   }
@@ -394,7 +395,7 @@ export class AgentLoop {
         break;
       }
 
-      const tool = getTool(block.name);
+      const tool = getTool(block.name || '');
       if (!tool) {
         toolResults.push({ type: 'tool_result', id: block.id, output: `未知工具: ${block.name}` });
         continue;

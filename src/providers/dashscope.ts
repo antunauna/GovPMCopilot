@@ -180,13 +180,11 @@ export class DashScopeProvider implements LLMProvider {
 
     if (!resp.ok) {
       const err = await resp.text();
-      yield { type: 'error', error: `DashScope API error ${resp.status}: ${err}` };
-      return;
+      throw new Error(`DashScope API error ${resp.status}: ${err}`);
     }
 
     if (!resp.body) {
-      yield { type: 'error', error: 'No response body' };
-      return;
+      throw new Error('No response body from DashScope');
     }
 
     const reader = resp.body.getReader();
@@ -200,8 +198,7 @@ export class DashScopeProvider implements LLMProvider {
     try {
       while (true) {
         if (options?.signal?.aborted) {
-          yield { type: 'error', error: 'Request aborted' };
-          return;
+          throw new DOMException('Request aborted', 'AbortError');
         }
 
         const { done, value } = await reader.read();
